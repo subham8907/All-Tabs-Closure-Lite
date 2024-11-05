@@ -1,0 +1,108 @@
+name: Chrome Extension Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: 'Release notes (use | for line breaks)'
+        required: true
+      additional_comments:
+        description: 'Additional comments (optional)'
+        required: false
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Read manifest version
+        id: manifest
+        run: |
+          VERSION=$(jq -r .version manifest.json)
+          echo "Version from manifest: $VERSION"
+          echo "manifest_version=$VERSION" >> $GITHUB_OUTPUT
+
+      # Create clean directory and pack source extension
+      - name: Prepare clean directory
+        run: |
+          mkdir clean_ext
+          rsync -av --exclude='*.pem' --exclude='.git*' --exclude='.github' . clean_ext/
+
+      - name: Install Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser
+
+      - name: Pack Source Extension
+        run: |
+          chromium-browser --pack-extension="$(pwd)/clean_ext"
+          mv clean_ext.crx "source_${{ github.event.repository.name }}.crx"
+
+      # Download from Chrome Web Store
+      - name: Download from Chrome Web Store
+        run: |
+          EXTENSION_ID="aeleccepmcaafbkibhdhklhbidbnniha"
+          wget "https://clients2.google.com/service/update2/crx?response=redirect&acceptformat=crx2,crx3&prodversion=98&x=id%3D${EXTENSION_ID}%26installsource%3Dondemand%26uc" -O "webstore_${{ github.event.repository.name }}.crx" || echo "Failed to download from Web Store"
+
+      # Create or update release
+      - name: Generate Release Notes
+        id: release_notes
+        run: |
+          VERSION="${{ steps.manifest.outputs.manifest_version }}"
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            NOTES="${{ github.event.inputs.release_notes }}"
+            COMMENTS="${{ github.event.inputs.additional_comments }}"
+          else
+            NOTES="Automated release from source code"
+            COMMENTS=""
+          fi
+          
+          # Create release notes
+          echo "### Release Notes" > RELEASE_NOTES.md
+          echo "Version: v$VERSION" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "Chrome Web Store: [All Tabs Closure Lite](https://chromewebstore.google.com/detail/all-tabs-closure-lite/aeleccepmcaafbkibhdhklhbidbnniha)" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "$NOTES" | sed 's/|/\n/g' >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          
+          if [ ! -z "$COMMENTS" ]; then
+            echo "### Additional Comments" >> RELEASE_NOTES.md
+            echo "$COMMENTS" | sed 's/|/\n/g' >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+          fi
+          
+          echo "### Files Included" >> RELEASE_NOTES.md
+          echo "- \`source_*.crx\`: Built directly from source code (v$VERSION)" >> RELEASE_NOTES.md
+          echo "- \`webstore_*.crx\`: Downloaded from Chrome Web Store" >> RELEASE_NOTES.md
+
+      - name: Create Tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          VERSION="${{ steps.manifest.outputs.manifest_version }}"
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+
+      - name: Create/Update Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.manifest.outputs.manifest_version }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            source_${{ github.event.repository.name }}.crx
+            webstore_${{ github.event.repository.name }}.crx
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Cleanup
+      - name: Cleanup
+        if: always()
+        run: rm -rf clean_ext RELEASE_NOTES.md
