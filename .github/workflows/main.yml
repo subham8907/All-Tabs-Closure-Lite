@@ -16,7 +16,99 @@ permissions:
   contents: write
 
 jobs:
+  verify-webstore-version:
+    runs-on: ubuntu-latest
+    outputs:
+      should_continue: ${{ steps.check-version.outputs.should_continue }}
+      attempt_number: ${{ steps.check-version.outputs.attempt_number }}
+      start_time: ${{ steps.check-version.outputs.start_time }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Read manifest version
+        id: manifest
+        run: |
+          VERSION=$(jq -r .version manifest.json)
+          echo "Version from manifest: $VERSION"
+          echo "manifest_version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check Web Store Version
+        id: check-version
+        run: |
+          EXTENSION_ID="aeleccepmcaafbkibhdhklhbidbnniha"
+          MANIFEST_VERSION="${{ steps.manifest.outputs.manifest_version }}"
+          
+          # Get the current attempt number and start time from artifact or set to 1 and current time
+          ATTEMPT=$(cat attempt_number.txt 2>/dev/null || echo "1")
+          START_TIME=$(cat start_time.txt 2>/dev/null || date +%s)
+          
+          echo "attempt_number=$ATTEMPT" >> $GITHUB_OUTPUT
+          echo "start_time=$START_TIME" >> $GITHUB_OUTPUT
+          
+          # Calculate elapsed time in hours
+          CURRENT_TIME=$(date +%s)
+          ELAPSED_HOURS=$(( ($CURRENT_TIME - $START_TIME) / 3600 ))
+          echo "Elapsed time: $ELAPSED_HOURS hours"
+          
+          # Get Web Store version using Chrome Web Store API
+          WEBSTORE_INFO=$(curl -s "https://chrome.google.com/webstore/detail/${EXTENSION_ID}?hl=en")
+          WEBSTORE_VERSION=$(echo "$WEBSTORE_INFO" | grep -oP '"version": "\K[^"]+' || echo "not_found")
+          
+          echo "Manifest version: $MANIFEST_VERSION"
+          echo "Web Store version: $WEBSTORE_VERSION"
+          
+          if [ "$WEBSTORE_VERSION" == "$MANIFEST_VERSION" ]; then
+            echo "should_continue=true" >> $GITHUB_OUTPUT
+            rm -f attempt_number.txt start_time.txt
+          else
+            echo "Versions don't match. This is attempt $ATTEMPT (Hour $ELAPSED_HOURS of 96)"
+            echo "should_continue=false" >> $GITHUB_OUTPUT
+            echo "$((ATTEMPT + 1))" > attempt_number.txt
+            echo "$START_TIME" > start_time.txt
+          fi
+
+      - name: Save attempt data
+        if: steps.check-version.outputs.should_continue != 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: attempt-data
+          path: |
+            attempt_number.txt
+            start_time.txt
+          retention-days: 5
+
+  schedule-recheck:
+    needs: verify-webstore-version
+    if: needs.verify-webstore-version.outputs.should_continue != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Calculate elapsed time
+        id: elapsed
+        run: |
+          START_TIME=${{ needs.verify-webstore-version.outputs.start_time }}
+          CURRENT_TIME=$(date +%s)
+          ELAPSED_HOURS=$(( ($CURRENT_TIME - $START_TIME) / 3600 ))
+          echo "ELAPSED_HOURS=$ELAPSED_HOURS" >> $GITHUB_ENV
+
+      - name: Schedule next check
+        run: |
+          ATTEMPT=${{ needs.verify-webstore-version.outputs.attempt_number }}
+          if [ "$ELAPSED_HOURS" -lt "96" ]; then
+            echo "Scheduling next check in 1 hour (Attempt $ATTEMPT, Hour $ELAPSED_HOURS of 96)"
+            gh workflow run "Chrome Extension Release" --ref ${{ github.ref }} \
+              --field release_notes="${{ github.event.inputs.release_notes }}" \
+              --field additional_comments="${{ github.event.inputs.additional_comments }}"
+          else
+            echo "Maximum time elapsed (96 hours / 4 days). Please verify the Web Store version manually."
+            exit 1
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   create-release:
+    needs: verify-webstore-version
+    if: needs.verify-webstore-version.outputs.should_continue == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
